@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+.venv/
+
+# macOS
+.DS_Store
+
+# Outputs
+md_output/
+metadata/
+chunks/
+processed/
+failed/
+
+vision_queue/
+vision_reports/
+vision_output/
+vision_done/
+vision_failed/
+vision_ocr/
+
+# Logs
+*.log
+

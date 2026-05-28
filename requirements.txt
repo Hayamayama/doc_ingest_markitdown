@@ -1,0 +1,9 @@
+markitdown[all]
+watchdog
+pymupdf
+ollama
+paddleocr
+pdf2image
+pillow
+numpy
+opencv-python
