@@ -61,7 +61,7 @@ DOC_INGEST_MARKITDOWN/
 ├── vision_worker.py
 ├── vision_worker_v2.py
 ├── run_pipeline.py
-└── readme.md
+└── README.md
 ```
 
 ---
@@ -287,6 +287,14 @@ vision_router.py
 
 The Vision Worker (`vision_worker_v2.py`) is not started by default, reducing resource consumption.
 
+For vision processing, the recommended execution mode is batch-based processing rather than continuous monitoring. Example:
+
+```bash
+python vision_worker_v2.py --once --limit 3 --ocr auto --unload
+```
+
+This configuration processes up to three queued vision tasks, automatically determines whether OCR should be applied, unloads the Ollama model after processing, and exits upon completion.
+
 ---
 
 To display the status of directories:
@@ -385,7 +393,7 @@ paper_page_005.json
 Manually start the Vision Worker:
 
 ```bash
-python vision_worker_v2.py
+python vision_worker_v2.py --once --limit 1 --ocr auto --unload
 ```
 
 ---
@@ -402,6 +410,90 @@ vision_done/
 
 ---
 
+# Vision Worker Execution Modes
+
+The Vision Worker supports multiple execution modes and runtime configuration options.
+
+## Batch Execution
+
+Process existing queue items once and exit:
+
+```bash
+python vision_worker_v2.py --once
+```
+
+---
+
+## Limited Batch Processing
+
+Limit the number of processed queue items:
+
+```bash
+python vision_worker_v2.py --once --limit 3
+```
+
+---
+
+## OCR Modes
+
+### Automatic OCR Selection (Recommended)
+
+```bash
+python vision_worker_v2.py --ocr auto
+```
+
+In this mode, the worker determines whether OCR should be executed based on router analysis metadata, including:
+
+- Text density
+- Image area ratio
+- Flowchart keywords
+- Diagram-related indicators
+- Drawing count
+
+---
+
+### Force OCR on All Pages
+
+```bash
+python vision_worker_v2.py --ocr on
+```
+
+---
+
+### Disable OCR
+
+```bash
+python vision_worker_v2.py --ocr off
+```
+
+This mode directly sends page images to the vision model without running PaddleOCR.
+
+---
+
+## Model Selection
+
+Specify the Ollama vision model:
+
+```bash
+python vision_worker_v2.py --model llama3.2-vision
+```
+
+This abstraction layer allows future integration of alternative vision models.
+
+---
+
+## Automatic Ollama Model Unloading
+
+Unload the Ollama model after processing:
+
+```bash
+python vision_worker_v2.py --unload
+```
+
+This reduces long-term memory residency and improves power efficiency on battery-powered devices.
+
+---
+
 # Vision Router Architecture
 
 The `vision_router.py` component does not perform OCR itself. Its primary function is to determine which document pages warrant computationally intensive vision analysis.
@@ -414,7 +506,9 @@ The router evaluates multiple factors including:
 - Flowchart-related keywords
 - Diagram-related keywords
 
-Based on these criteria, it computes a vision score for each page. Only pages exceeding a predefined threshold are enqueued for vision processing. This selective routing optimizes resource utilization by focusing on pages with substantive visual content.
+Based on these criteria, it computes a vision score for each page. Only pages exceeding a predefined threshold are enqueued for vision processing.
+The resulting router metadata is also used by `vision_worker_v2.py` to dynamically determine whether OCR should be executed when operating in automatic OCR mode.
+This selective routing optimizes resource utilization by focusing on pages with substantive visual content.
 
 ---
 
@@ -517,7 +611,16 @@ python ask.py "What are the contraindications?"
 
 ## Vision Worker Resource Usage
 
-The `llama3.2-vision` model represents the most computationally intensive component of the system. It is recommended to operate this component only when necessary and preferably when connected to external power.
+The Vision Worker is the most computationally intensive component of the pipeline, particularly when using local vision-language models such as `llama3.2-vision`.
+
+To improve operational efficiency, the worker supports:
+
+- Batch-based execution
+- Queue-limited processing
+- Automatic Ollama model unloading
+- Selective OCR execution
+
+For battery-powered systems, batch execution with `--once`, `--limit`, and `--unload` is recommended.
 
 ---
 

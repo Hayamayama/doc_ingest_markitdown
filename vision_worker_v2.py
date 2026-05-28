@@ -1,6 +1,6 @@
 from pathlib import Path
 from datetime import datetime
-import base64
+import argparse
 import json
 import shutil
 import subprocess
@@ -20,6 +20,10 @@ VISION_FAILED_DIR = BASE_DIR / "vision_failed"
 VISION_OCR_DIR = BASE_DIR / "vision_ocr"
 
 OLLAMA_MODEL = "llama3.2-vision"
+
+OCR_MODE_AUTO = "auto"
+OCR_MODE_ON = "on"
+OCR_MODE_OFF = "off"
 
 for folder in [
     VISION_QUEUE_DIR,
@@ -106,10 +110,6 @@ def load_queue_metadata(metadata_path: Path) -> dict[str, Any]:
     return json.loads(metadata_path.read_text(encoding="utf-8"))
 
 
-def encode_image_base64(image_path: Path) -> str:
-    return base64.b64encode(image_path.read_bytes()).decode("utf-8")
-
-
 def run_paddleocr_if_available(image_path: Path) -> dict[str, Any]:
     """
     Optional local OCR layer.
@@ -189,12 +189,52 @@ def check_ollama_available() -> bool:
         return False
 
 
-def call_ollama_vision(image_path: Path, ocr_text: str = "") -> str:
+def should_run_ocr(queue_payload: dict[str, Any], ocr_mode: str) -> bool:
+    if ocr_mode == OCR_MODE_ON:
+        return True
+
+    if ocr_mode == OCR_MODE_OFF:
+        return False
+
+    analysis = queue_payload.get("analysis", {})
+    reasons = set(analysis.get("reasons", []))
+    keyword_hits = analysis.get("keyword_hits", [])
+    text_length = int(analysis.get("text_length", 0) or 0)
+    image_area_ratio = float(analysis.get("image_area_ratio", 0) or 0)
+    drawing_count = int(analysis.get("drawing_count", 0) or 0)
+
+    if text_length < 300:
+        return True
+
+    if "large_image_area" in reasons:
+        return True
+
+    if "diagram_or_flowchart_keywords" in reasons:
+        return True
+
+    if keyword_hits:
+        return True
+
+    if image_area_ratio >= 0.25:
+        return True
+
+    if drawing_count >= 20:
+        return True
+
+    return False
+
+
+def call_ollama_vision(
+    image_path: Path,
+    ocr_text: str = "",
+    model: str = OLLAMA_MODEL,
+    unload_after_call: bool = False,
+) -> str:
     """
     Calls local Ollama vision model through the Python ollama package.
     Requires:
         pip install ollama
-        ollama pull llama3.2-vision
+        ollama pull <vision-model>
     """
     try:
         import ollama  # type: ignore
@@ -219,7 +259,7 @@ def call_ollama_vision(image_path: Path, ocr_text: str = "") -> str:
         )
 
     response = ollama.chat(
-        model=OLLAMA_MODEL,
+        model=model,
         messages=[
             {
                 "role": "user",
@@ -227,6 +267,7 @@ def call_ollama_vision(image_path: Path, ocr_text: str = "") -> str:
                 "images": [str(image_path)],
             }
         ],
+        keep_alive=0 if unload_after_call else None,
     )
 
     message = response.get("message", {})
@@ -243,6 +284,7 @@ def build_output_markdown(
     image_path: Path,
     ocr_payload: dict[str, Any],
     vision_markdown: str,
+    model: str,
 ) -> str:
     source_document = queue_payload.get("source_document", "unknown")
     page = queue_payload.get("page", "unknown")
@@ -254,8 +296,9 @@ page: {page}
 page_image: "{image_path.name}"
 processed_at: "{datetime.now().isoformat(timespec='seconds')}"
 status: "vision_processed"
-vision_model: "{OLLAMA_MODEL}"
+vision_model: "{model}"
 ocr_engine: "paddleocr"
+ocr_mode: "{ocr_payload.get('mode', 'unknown')}"
 ocr_available: {str(bool(ocr_payload.get('available'))).lower()}
 ---
 
@@ -281,15 +324,20 @@ ocr_available: {str(bool(ocr_payload.get('available'))).lower()}
 """
 
 
-def process_queue_item(metadata_path: Path):
+def process_queue_item(
+    metadata_path: Path,
+    ocr_mode: str = OCR_MODE_AUTO,
+    model: str = OLLAMA_MODEL,
+    unload_after_call: bool = False,
+) -> bool:
     if metadata_path.suffix.lower() != ".json":
-        return
+        return False
 
     print(f"處理 vision queue：{metadata_path.name}")
 
     if not wait_until_file_is_stable(metadata_path):
         print(f"Queue metadata 尚未準備好：{metadata_path.name}")
-        return
+        return False
 
     try:
         queue_payload = load_queue_metadata(metadata_path)
@@ -305,14 +353,28 @@ def process_queue_item(metadata_path: Path):
 
         if not wait_until_file_is_stable(image_path):
             print(f"頁面圖片尚未準備好：{image_path.name}")
-            return
+            return False
 
         source_document = queue_payload.get("source_document", "unknown_document")
         page = int(queue_payload.get("page", 0))
         output_stem = f"{Path(source_document).stem}_page_{page:03d}_vision"
 
-        print("開始 local OCR...")
-        ocr_payload = run_paddleocr_if_available(image_path)
+        run_ocr = should_run_ocr(queue_payload, ocr_mode)
+
+        if run_ocr:
+            print(f"OCR 模式：{ocr_mode}，開始 local OCR...")
+            ocr_payload = run_paddleocr_if_available(image_path)
+            ocr_payload["mode"] = ocr_mode
+        else:
+            print(f"OCR 模式：{ocr_mode}，略過 OCR，直接使用 vision model 分析圖片")
+            ocr_payload = {
+                "available": False,
+                "engine": "paddleocr",
+                "mode": ocr_mode,
+                "skipped": True,
+                "items": [],
+                "plain_text": "",
+            }
 
         ocr_output_path = safe_path(VISION_OCR_DIR / f"{output_stem}_ocr.json")
         ocr_output_path.write_text(
@@ -322,13 +384,17 @@ def process_queue_item(metadata_path: Path):
 
         if ocr_payload.get("available"):
             print(f"OCR 完成，偵測到 {len(ocr_payload.get('items', []))} 個文字項目")
+        elif ocr_payload.get("skipped"):
+            print("OCR 已略過")
         else:
             print("OCR 不可用或失敗，改用 vision model 直接分析圖片")
 
-        print(f"開始呼叫 Ollama vision model：{OLLAMA_MODEL}")
+        print(f"開始呼叫 Ollama vision model：{model}")
         vision_markdown = call_ollama_vision(
             image_path=image_path,
             ocr_text=ocr_payload.get("plain_text", ""),
+            model=model,
+            unload_after_call=unload_after_call,
         )
 
         output_path = safe_path(VISION_OUTPUT_DIR / f"{output_stem}.md")
@@ -337,6 +403,7 @@ def process_queue_item(metadata_path: Path):
             image_path=image_path,
             ocr_payload=ocr_payload,
             vision_markdown=vision_markdown,
+            model=model,
         )
         output_path.write_text(output_markdown, encoding="utf-8")
 
@@ -348,6 +415,8 @@ def process_queue_item(metadata_path: Path):
         print(f"已移動 queue metadata：{done_metadata_path.name}")
         print(f"已移動 queue image：{done_image_path.name}")
 
+        return True
+
     except Exception:
         error_path = safe_path(VISION_FAILED_DIR / f"{metadata_path.stem}_worker_v2_error.txt")
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
@@ -358,42 +427,169 @@ def process_queue_item(metadata_path: Path):
             pass
 
         print(f"Vision worker v2 失敗：{metadata_path.name}，錯誤已寫入 vision_failed/")
+        return False
 
 
 class VisionQueueHandler(FileSystemEventHandler):
+    def __init__(
+        self,
+        ocr_mode: str = OCR_MODE_AUTO,
+        model: str = OLLAMA_MODEL,
+        unload_after_call: bool = False,
+    ):
+        self.ocr_mode = ocr_mode
+        self.model = model
+        self.unload_after_call = unload_after_call
+
     def on_created(self, event):
         if event.is_directory:
             return
 
-        process_queue_item(Path(event.src_path))
+        process_queue_item(
+            Path(event.src_path),
+            ocr_mode=self.ocr_mode,
+            model=self.model,
+            unload_after_call=self.unload_after_call,
+        )
 
     def on_moved(self, event):
         if event.is_directory:
             return
 
-        process_queue_item(Path(event.dest_path))
+        process_queue_item(
+            Path(event.dest_path),
+            ocr_mode=self.ocr_mode,
+            model=self.model,
+            unload_after_call=self.unload_after_call,
+        )
 
 
-if __name__ == "__main__":
-    print("開始監控 vision_queue/。")
-    print(f"Vision output 輸出位置：{VISION_OUTPUT_DIR}")
-    print(f"Vision OCR 輸出位置：{VISION_OCR_DIR}")
-    print(f"Vision done 位置：{VISION_DONE_DIR}")
-    print(f"使用 Ollama vision model：{OLLAMA_MODEL}")
-
-    existing_metadata_files = [
+def get_existing_metadata_files() -> list[Path]:
+    return [
         p for p in VISION_QUEUE_DIR.iterdir()
         if p.is_file() and p.suffix.lower() == ".json"
     ]
 
+
+def unload_ollama_model(model: str):
+    try:
+        result = subprocess.run(
+            ["ollama", "stop", model],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode == 0:
+            print(f"已卸載 Ollama model：{model}")
+        else:
+            print(f"嘗試卸載 Ollama model 失敗：{model}")
+            if result.stderr.strip():
+                print(result.stderr.strip())
+
+    except Exception as exc:
+        print(f"卸載 Ollama model 時發生錯誤：{exc}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Process vision_queue items with local OCR and Ollama vision model."
+    )
+
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process existing queue items once, then exit without watching the folder.",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of queue items to process in this run.",
+    )
+
+    parser.add_argument(
+        "--ocr",
+        choices=[OCR_MODE_AUTO, OCR_MODE_ON, OCR_MODE_OFF],
+        default=OCR_MODE_AUTO,
+        help="OCR mode. auto uses router analysis to decide; on always runs PaddleOCR; off always skips OCR.",
+    )
+
+    parser.add_argument(
+        "--unload",
+        action="store_true",
+        help="Unload the Ollama model after each vision call and after the run finishes.",
+    )
+
+    parser.add_argument(
+        "--model",
+        default=OLLAMA_MODEL,
+        help=f"Ollama vision model to use. Default: {OLLAMA_MODEL}",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    print("開始 vision worker v2。")
+    print(f"Vision queue 位置：{VISION_QUEUE_DIR}")
+    print(f"Vision output 輸出位置：{VISION_OUTPUT_DIR}")
+    print(f"Vision OCR 輸出位置：{VISION_OCR_DIR}")
+    print(f"Vision done 位置：{VISION_DONE_DIR}")
+    print(f"使用 Ollama vision model：{args.model}")
+    print(f"OCR 模式：{args.ocr}")
+
+    if args.unload:
+        print("Ollama unload：enabled")
+
+    existing_metadata_files = get_existing_metadata_files()
+
     if existing_metadata_files:
         print(f"發現 {len(existing_metadata_files)} 個既有 queue item，開始處理...")
 
+        processed_count = 0
+
         for metadata_file in existing_metadata_files:
-            process_queue_item(metadata_file)
+            if args.limit is not None and processed_count >= args.limit:
+                print(f"已達本次處理上限：{args.limit}")
+                break
+
+            success = process_queue_item(
+                metadata_file,
+                ocr_mode=args.ocr,
+                model=args.model,
+                unload_after_call=args.unload,
+            )
+
+            if success:
+                processed_count += 1
+
+        print(f"本次已成功處理 queue item 數量：{processed_count}")
+
+    else:
+        print("目前沒有既有 queue item。")
+
+    if args.once:
+        if args.unload:
+            unload_ollama_model(args.model)
+        print("--once 模式完成，vision worker v2 結束。")
+        raise SystemExit(0)
+
+    print("開始監控 vision_queue/。按 Ctrl + C 停止。")
 
     observer = Observer()
-    observer.schedule(VisionQueueHandler(), str(VISION_QUEUE_DIR), recursive=False)
+    observer.schedule(
+        VisionQueueHandler(
+            ocr_mode=args.ocr,
+            model=args.model,
+            unload_after_call=args.unload,
+        ),
+        str(VISION_QUEUE_DIR),
+        recursive=False,
+    )
     observer.start()
 
     try:
@@ -402,5 +598,12 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("停止 vision worker v2。")
         observer.stop()
+    finally:
+        if args.unload:
+            unload_ollama_model(args.model)
 
     observer.join()
+
+
+if __name__ == "__main__":
+    main()
